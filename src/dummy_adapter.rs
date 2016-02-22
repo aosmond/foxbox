@@ -133,17 +133,25 @@ impl ServiceAdapter for DummyAdapter {
     }
 
     fn upnp_discover(&mut self, service: &UpnpService) -> bool {
+        let desc = &service.description;
+
         // Let the dummy adapter own the Hue simulator
-        let owns = service.msearch.device_id == "uuid:2f402f80-da50-11e1-9b23-c86000788a05";
+        let owns = service.msearch.device_id.contains("uuid:2f402f80-da50-11e1-9b23-") &&
+                   desc.get("/root/device/modelName").unwrap() == "Philips hue bridge 2012" &&
+                   desc.get("/root/device/modelNumber").unwrap() == "929000226503";
         if owns {
             println!("Found Phillips Hue simulator upnp service: {:?}", service);
             if self.rediscover {
                 self.rediscover = false;
                 let sender = self.sender.clone();
+                let target = match desc.get("/root/device/deviceType") {
+                    Some(x) => Some(x.to_lowercase()),
+                    None => None
+                };
                 thread::spawn(move || {
-                    thread::sleep(Duration::from_millis(5000));
+                    thread::sleep(Duration::from_millis(10000));
                     println!("Requesting rediscovery of Hue simulator");
-                    sender.send(EventData::UpnpSearch { target: None }).unwrap();
+                    sender.send(EventData::UpnpSearch { target: target }).unwrap();
                 });
             }
         }
