@@ -6,6 +6,7 @@ extern crate serde;
 
 use iron::{Request, Response, IronResult};
 use self::serde::ser::{ Serialize, Serializer };
+use upnp::UpnpService;
 
 pub type ServiceID = String;
 
@@ -35,6 +36,7 @@ impl Serialize for Service {
 
 pub trait ServiceAdapter {
     fn get_name(&self) -> String;
+    fn upnp_discover(&mut self, service: &UpnpService) -> bool;
     fn start(&self);
     fn stop(&self);
 }

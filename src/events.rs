@@ -5,11 +5,14 @@
 extern crate mio;
 
 use service::ServiceID;
+use upnp::UpnpService;
 
 pub enum EventData {
     AdapterStart { name: String },
     ServiceStart { id: ServiceID },
-    ServiceStop { id: ServiceID }
+    ServiceStop { id: ServiceID },
+    UpnpServiceDiscovered { service: UpnpService },
+    UpnpSearch { target: Option<String> }
 }
 
 impl EventData {
@@ -18,6 +21,9 @@ impl EventData {
             EventData::AdapterStart { ref name } => name,
             EventData::ServiceStart { ref id }
             | EventData::ServiceStop { ref id } => id,
+            EventData::UpnpSearch { ref target } => return format!("upnp search {:?}", target),
+            EventData::UpnpServiceDiscovered { ref service } =>
+                return format!("upnp service discovered {}", service.msearch.device_id)
         };
 
         description.to_string()

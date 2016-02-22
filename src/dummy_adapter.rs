@@ -9,6 +9,7 @@ use iron::headers::ContentType;
 use iron::status::Status;
 use router::Router;
 use service::{ Service, ServiceAdapter, ServiceProperties };
+use upnp::UpnpService;
 use std::time::Duration;
 use std::thread;
 use uuid::Uuid;
@@ -82,7 +83,8 @@ impl Service for DummyService {
 pub struct DummyAdapter {
     name: String,
     sender: EventSender,
-    context: SharedContext
+    context: SharedContext,
+    rediscover: bool
 }
 
 impl DummyAdapter {
@@ -91,7 +93,8 @@ impl DummyAdapter {
         println!("Creating dummy adapter");
         DummyAdapter { name: "DummyAdapter".to_owned(),
                        sender: sender,
-                       context: context
+                       context: context,
+                       rediscover: true
                      }
     }
 }
@@ -127,5 +130,23 @@ impl ServiceAdapter for DummyAdapter {
 
     fn stop(&self) {
         println!("Stopping dummy adapter");
+    }
+
+    fn upnp_discover(&mut self, service: &UpnpService) -> bool {
+        // Let the dummy adapter own the Hue simulator
+        let owns = service.msearch.device_id == "uuid:2f402f80-da50-11e1-9b23-c86000788a05";
+        if owns {
+            println!("Found Phillips Hue simulator upnp service: {:?}", service);
+            if self.rediscover {
+                self.rediscover = false;
+                let sender = self.sender.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(5000));
+                    println!("Requesting rediscovery of Hue simulator");
+                    sender.send(EventData::UpnpSearch { target: None }).unwrap();
+                });
+            }
+        }
+        owns
     }
 }
