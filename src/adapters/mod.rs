@@ -3,7 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 /// An adapter dedicated to the Philips Hue
-mod philips_hue;
+pub mod philips_hue;
+pub mod new_hue;
 
 /// An adapter providing time services.
 pub mod clock;
@@ -11,12 +12,11 @@ pub mod clock;
 /// An adapter providing WebPush services.
 pub mod webpush;
 
-mod ip_camera;
+pub mod ip_camera;
 
 use foxbox_taxonomy::adapter::AdapterManagerHandle;
 use foxbox_taxonomy::api::API;
 
-use self::philips_hue::PhilipsHueAdapter;
 use service::ServiceAdapter;
 use traits::Controller;
 
@@ -36,18 +36,19 @@ impl<T: Controller> AdapterManager<T> {
 
     /// Start all the adapters.
     pub fn start<A>(&mut self, adapter_manager: A)
-        where A: AdapterManagerHandle + API + Clone + 'static {
+        where A: AdapterManagerHandle + API + Send + Clone + 'static {
         let c = self.controller.clone(); // extracted here to prevent double-borrow of 'self'
-        self.start_adapter(Box::new(PhilipsHueAdapter::new(c.clone())));
+        //self.start_adapter(Box::new(philips_hue::PhilipsHueAdapter::new(c.clone())));
+        new_hue::PhilipsHue::init(adapter_manager.clone(), c.clone()).unwrap(); // FIXME: We should have a way to report
         clock::Clock::init(&adapter_manager).unwrap(); // FIXME: We should have a way to report errors
         webpush::WebPush::init(c, &adapter_manager).unwrap();
         ip_camera::IPCameraAdapter::init(adapter_manager.clone(), self.controller.clone()).unwrap();
     }
 
-    fn start_adapter(&mut self, adapter: Box<ServiceAdapter>) {
-        adapter.start();
-        self.adapters.push(adapter);
-    }
+    // fn start_adapter(&mut self, adapter: Box<ServiceAdapter>) {
+    //     adapter.start();
+    //     self.adapters.push(adapter);
+    // }
 
     /// Stop all the adapters.
     pub fn stop(&self) {
