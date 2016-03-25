@@ -5,28 +5,33 @@
 use foxbox_taxonomy::adapter::AdapterManagerHandle;
 use serde_json;
 use std::collections::HashMap;
-use std::sync::{ Arc, RwLock };
+use std::sync::{ Arc, Mutex };
 use std::thread;
 use std::time::Duration;
 use super::http;
 use super::hub;
 use traits::Controller;
 
-pub struct Discovery<C> {
+pub struct Discovery<C, A>
+    where A: AdapterManagerHandle + Send + Clone + 'static,
+          C: Controller
+{
     controller: C,
-    hubs: Arc<RwLock<HashMap<String, hub::Hub<C>>>>,
+    hubs: Arc<Mutex<HashMap<String, hub::Hub<C, A>>>>,
 }
 
-impl<C: Controller> Discovery<C> {
+impl<C, A> Discovery<C, A>
+    where A: AdapterManagerHandle + Send + Clone + 'static,
+          C: Controller
+{
     pub fn new(controller: C) -> Self {
         Discovery {
             controller: controller,
-            hubs: Arc::new(RwLock::new(HashMap::new())),
+            hubs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn start<A>(&self, adapt: A)
-        where A: AdapterManagerHandle + Send + Clone + 'static
+    pub fn start(&self, adapt: A)
     {
         let controller = self.controller.clone();
         let hubs = self.hubs.clone();
@@ -43,7 +48,7 @@ impl<C: Controller> Discovery<C> {
                 hub.start(adapt.clone());
                 // This will lead to weirdness if hubs with identical IDs
                 // are popping up on the network. (Think DoS!)
-                hubs.write().unwrap().insert(nupnp.id, hub);
+                hubs.lock().unwrap().insert(nupnp.id, hub);
             }
 
             loop { // Forever

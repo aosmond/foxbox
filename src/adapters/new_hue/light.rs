@@ -13,15 +13,17 @@ const CUSTOM_PROPERTY_MANUFACTURER: &'static str = "manufacturer";
 const CUSTOM_PROPERTY_MODEL: &'static str = "model";
 const CUSTOM_PROPERTY_NAME: &'static str = "name";
 
-pub struct Light {
+pub struct Light<A>
+    where A: AdapterManagerHandle + Send + Clone + 'static {
     id: String,
     api: Arc<HubApi>,
-    adapt: AdapterManagerHandle + Send,
+    adapt: A,
 }
 
-impl Light {
-    pub fn new<A>(adapt: A, api: Arc<HubApi>, light_id: &str) -> Self
-        where A: AdapterManagerHandle + Send + Clone + 'static
+impl<A> Light<A>
+    where A: AdapterManagerHandle + Send + Clone + 'static
+{
+    pub fn new(adapt: A, api: Arc<HubApi>, light_id: &str) -> Self
     {
         debug!("Creating ColorLight with ID {} on hub {}", light_id, api.id);
         Light{

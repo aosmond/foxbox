@@ -7,7 +7,7 @@ use foxbox_taxonomy::api::API;
 use serde_json;
 use service::Service;
 use std::collections::{ BTreeMap, HashMap };
-use std::sync::{ Arc, Mutex, RwLock };
+use std::sync::{ Arc, Mutex };
 use std::thread;
 use std::time::Duration;
 use super::hub_api::HubApi;
@@ -16,15 +16,21 @@ use super::structs;
 use traits::Controller;
 use uuid::Uuid;
 
-pub struct Hub<C> {
+pub struct Hub<C, A>
+    where A: AdapterManagerHandle + Send + Clone + 'static,
+          C: Controller
+{
     id: String,
     ip: String,
     controller: C,
     api: Arc<HubApi>,
-    lights: Arc<RwLock<HashMap<String, Arc<light::Light>>>>,
+    lights: Arc<Mutex<HashMap<String, Box<light::Light<A>>>>>,
 }
 
-impl<C: Controller> Hub<C> {
+impl<C, A> Hub<C, A>
+    where A: AdapterManagerHandle + Send + Clone + 'static,
+          C: Controller
+{
     pub fn new(id: &str, ip: &str, controller: C) -> Self {
         // Get API token from config store, default to a random UUID.
         let token = controller.get_config().get_or_set_default(
@@ -36,11 +42,11 @@ impl<C: Controller> Hub<C> {
             ip: ip.to_owned(),
             controller: controller,
             api: Arc::new(HubApi::new(id, ip, &token)),
-            lights: Arc::new(RwLock::new(HashMap::new())),
+            lights: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn start<A>(&self, adapt: A) where A: AdapterManagerHandle + Send + Clone + 'static {
+    pub fn start(&self, adapt: A) {
         let controller = self.controller.clone();
         let api = self.api.clone();
         let adapt = adapt.clone();
@@ -100,9 +106,9 @@ impl<C: Controller> Hub<C> {
                 let light_ids = api.get_lights();
                 for light_id in light_ids {
                     debug!("Found light {} on hub {}", light_id, api.id);
-                    let new_light = Arc::new(light::Light::new(adapt.clone(), api.clone(), &light_id));
+                    let new_light = Box::new(light::Light::new(adapt.clone(), api.clone(), &light_id));
                     new_light.start();
-                    lights.write().unwrap().insert(light_id, new_light);
+                    lights.lock().unwrap().insert(light_id, new_light);
                 }
 
                 loop { // forever
@@ -115,7 +121,7 @@ impl<C: Controller> Hub<C> {
     pub fn stop(&self) {
         info!("Stopping Philips Hue Bridge service for ID {}", self.id);
         let lights = self.lights.clone();
-        let mut lights_write = lights.write().unwrap();
+        let mut lights_write = lights.lock().unwrap();
         for (_, light) in lights_write.drain() {
             light.stop();
         }

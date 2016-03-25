@@ -25,23 +25,28 @@ static ADAPTER_NAME: &'static str = "Philips Hue adapter (built-in)";
 static ADAPTER_VENDOR: &'static str = "team@link.mozilla.org";
 static ADAPTER_VERSION: [u32;4] = [0, 0, 0, 0];
 
-pub struct PhilipsHue<C> {
+pub struct PhilipsHue<C, A>
+    where A: AdapterManagerHandle + Send + Clone + 'static,
+          C: Controller
+{
     controller: C,
-    discovery: Arc<discovery::Discovery<C>>,
+    discovery: discovery::Discovery<C, A>,
     /// Timer used to dispatch `register_watch` requests.
     timer: timer::Timer,
     getter_timestamp_id: Id<Getter>,
     getter_time_of_day_id: Id<Getter>,
 }
 
-impl<C: Controller> PhilipsHue<C> {
-    pub fn init<A>(adapt: A, controller: C) -> Result<(), Error>
-        where A: AdapterManagerHandle + Send + Clone + 'static
+impl<C, A> PhilipsHue<C, A>
+    where A: AdapterManagerHandle + Send + Clone + 'static,
+          C: Controller
+{
+    pub fn init(adapt: A, controller: C) -> Result<(), Error>
     {
         let discovery = discovery::Discovery::new(controller.clone());
         let hue_adapter = Box::new(PhilipsHue {
             controller: controller,
-            discovery: Arc::new(discovery),
+            discovery: discovery,
             timer: timer::Timer::new(),
             getter_timestamp_id: Id::new("getter:timestamp.philips_hue@link.mozilla.org"),
             getter_time_of_day_id: Id::new("getter:time_of_day.philips_hue@link.mozilla.org"),
@@ -52,7 +57,10 @@ impl<C: Controller> PhilipsHue<C> {
     }
 }
 
-impl<C: Controller> PhilipsHue<C> {
+impl<C, A> PhilipsHue<C, A>
+    where A: AdapterManagerHandle + Send + Clone + 'static,
+          C: Controller
+{
     pub fn id() -> Id<AdapterId> {
         Id::new("philips_hue@link.mozilla.org")
     }
@@ -76,7 +84,10 @@ impl<C: Controller> PhilipsHue<C> {
     }
 }
 
-impl<C: Controller> Adapter for PhilipsHue<C> {
+impl<C, A> Adapter for PhilipsHue<C, A>
+    where A: AdapterManagerHandle + Send + Clone + 'static,
+          C: Controller
+{
     fn id(&self) -> Id<AdapterId> {
         Self::id()
     }
