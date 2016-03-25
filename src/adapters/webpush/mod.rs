@@ -24,7 +24,9 @@ use hyper::header::{ ContentEncoding, Encoding };
 use hyper::Client;
 use hyper::client::Body;
 use rusqlite::{ self };
+use self::crypto::{ encrypt, generate_key_pair, KeyPair };
 use serde_json;
+use std::cmp::min;
 use std::collections::{ HashMap, HashSet };
 use std::sync::Arc;
 use std::thread;
@@ -73,8 +75,26 @@ impl ResourceGetter {
 }
 
 impl Subscription {
-    fn notify(&self, message: &str) {
-        let enc = match self::crypto::encrypt(&self.public_key, message.to_owned()) {
+    fn notify(&self, local_key: &KeyPair, message: &str) {
+        // Make the record size at least the size of the encrypted message. We must
+        // add 16 bytes for the encryption tag, 1 byte for padding and 1 byte to
+        // ensure we don't end on a record boundary.
+        //
+        // https://tools.ietf.org/html/draft-ietf-webpush-encryption-02#section-3.2
+        //
+        // "An application server MUST encrypt a push message with a single record.
+        //  This allows for a minimal receiver implementation that handles a single
+        //  record. If the message is 4096 octets or longer, the "rs" parameter MUST
+        //  be set to a value that is longer than the encrypted push message length."
+        //
+        // The push service is not obligated to accept larger records however.
+        //
+        // "Note that a push service is not required to support more than 4096 octets
+        // of payload body, which equates to 4080 octets of cleartext, so the "rs"
+        // parameter can be omitted for messages that fit within this limit."
+        //
+        let record_size = min(4096, message.len() + 18);
+        let enc = match encrypt(local_key, &self.public_key, message.to_owned(), record_size) {
             Some(x) => x,
             None => {
                 warn!("notity subscription {} failed for {}", self.push_uri, message);
@@ -85,8 +105,8 @@ impl Subscription {
         let client = Client::new();
         let res = match client.post(&self.push_uri)
             .header(ContentEncoding(vec![Encoding::EncodingExt(String::from("aesgcm128"))]))
-            .header(EncryptionKey(format!("keyid=p256dh;dh={}", enc.public_key)))
-            .header(Encryption(format!("keyid=p256dh;salt={}", enc.salt)))
+            .header(EncryptionKey(format!("keyid=p256dh;dh={}", local_key.public_key)))
+            .header(Encryption(format!("keyid=p256dh;salt={};rs={}", enc.salt, record_size)))
             .body(Body::BufBody(&enc.output, enc.output.len()))
             .send() {
                 Ok(x) => x,
@@ -99,6 +119,7 @@ impl Subscription {
 
 pub struct WebPush<C> {
     controller: C,
+    local_key: KeyPair,
     getter_resource_id: Id<Getter>,
     getter_subscription_id: Id<Getter>,
     setter_resource_id: Id<Setter>,
@@ -335,6 +356,7 @@ impl<C: Controller> WebPush<C> {
     {
         WebPush {
             controller: controller,
+            local_key: generate_key_pair().unwrap(),
             getter_resource_id: Self::getter_resource_id(),
             getter_subscription_id: Self::getter_subscription_id(),
             setter_resource_id: Self::setter_resource_id(),
@@ -384,14 +406,15 @@ impl<C: Controller> WebPush<C> {
     fn set_notify(&self, _: i32, setter: &WebPushNotify) -> rusqlite::Result<()> {
         info!("notify on resource {}: {}", setter.resource, setter.message);
 
-        let json = json!({resource: setter.resource, message: setter.message});
         let subscriptions = try!(self.get_resource_subscriptions(&setter.resource));
         if subscriptions.is_empty() {
             debug!("no users listening on push resource");
         } else {
+            let json = json!({resource: setter.resource, message: setter.message});
+            let local_key = self.local_key.clone();
             thread::spawn(move || {
                 for sub in subscriptions {
-                    sub.notify(&json);
+                    sub.notify(&local_key, &json);
                 }
             });
         }

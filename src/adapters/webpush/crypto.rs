@@ -19,8 +19,10 @@ use self::crypto::hmac::Hmac;
 use self::crypto::sha2::Sha256;
 use self::crypto::mac::Mac;
 
+use std::cmp::min;
 use std::ffi::{ CString, CStr };
 use std::ptr;
+use std::sync::{ Arc, Mutex };
 use rand::Rng;
 use rand::os::OsRng;
 
@@ -311,41 +313,76 @@ fn ecdh_export_public_key(key: *mut EvpPkey) -> Option<String> {
     status
 }
 
-struct EcdhKeyData {
-    /// String of hex digits representing the local public key.
-    public_key: String,
-    /// Byte array representing the shared key with the peer.
-    shared_key: Vec<u8>
+struct KeyPairStore {
+    key: *mut EvpPkey,
 }
 
-/// Derives a public key and a shared key from the given peer's public key.
-///
-/// * `raw_peer_key` is the peer's public ECDH key represented as hex digits.
-fn ecdh_derive_keys(raw_peer_key : String) -> Option<EcdhKeyData> {
-    let peer_key = ecdh_import_public_key(raw_peer_key);
+impl Drop for KeyPairStore {
+    fn drop(&mut self) {
+        if !self.key.is_null() {
+            unsafe { EVP_PKEY_free(self.key); }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct KeyPair {
+    /// base64 encoding representing the local public key.
+    pub public_key: String,
+    key_pair: Arc<Mutex<KeyPairStore>>
+}
+
+unsafe impl Send for KeyPair {}
+unsafe impl Sync for KeyPair {}
+
+/// Generates a local key pair.
+pub fn generate_key_pair() -> Option<KeyPair> {
     let local_key = ecdh_generate_key_pair();
-    let shared_key = ecdh_derive_shared_key(local_key, peer_key);
     let public_key = ecdh_export_public_key(local_key);
 
-    unsafe {
-        if !peer_key.is_null() { EVP_PKEY_free(peer_key); }
-        if !local_key.is_null() { EVP_PKEY_free(local_key); }
-    }
-
-    if shared_key.is_none() || public_key.is_none() {
+    if local_key.is_null() || public_key.is_none() {
         return None;
     }
 
-    Some(EcdhKeyData {
-        public_key: public_key.unwrap(),
-        shared_key: shared_key.unwrap()
+    let public_key_bytes = match public_key.unwrap().from_hex() {
+        Ok(x) => x,
+        Err(e) => {
+            warn!("Could not derive keys: {:?}", e);
+            return None;
+        }
+    };
+
+    Some(KeyPair {
+        public_key: public_key_bytes.to_base64(URL_SAFE),
+        // This needs to be protected by a mutex because OpenSSL updates
+        // the reference count, even if we shouldn't need to modify anything
+        // else with the local key.
+        key_pair: Arc::new(Mutex::new(KeyPairStore {
+            key: local_key
+        }))
     })
+}
+
+/// Derives a shared key from the given peer's public key and our local key pair.
+///
+/// * `raw_peer_key` is the peer's public ECDH key represented as hex digits.
+fn ecdh_derive_keys(local_key: &KeyPair, raw_peer_key : String) -> Option<Vec<u8>> {
+    let peer_key = ecdh_import_public_key(raw_peer_key);
+    let key_pair = local_key.key_pair.lock().unwrap().key;
+    let shared_key = ecdh_derive_shared_key(key_pair, peer_key);
+    if !peer_key.is_null() {
+        unsafe { EVP_PKEY_free(peer_key); }
+    }
+    shared_key
 }
 
 /// Encrypts the given payload using AES-GCM 128-bit with the shared key and salt.
 /// The shared key and salt are not used directly but rather are used to derive
 /// the encryption key and nonce as defined in the draft RFC.
-fn aesgcm128_encrypt(input: String, shared_key: Vec<u8>, salt: &[u8]) -> Vec<u8> {
+fn aesgcm128_encrypt(input: String, shared_key: Vec<u8>, salt: &[u8], record_size: usize) -> Vec<u8> {
+    assert!(!input.is_empty(), "input cannot be empty");
+    assert!(record_size > 1, "record size must be greater than the padding");
+
     // Create the HKDF salt from our shared key and transaction salt
     let mut salt_hmac = Hmac::new(Sha256::new(), salt);
     salt_hmac.input(&shared_key[..]);
@@ -363,47 +400,94 @@ fn aesgcm128_encrypt(input: String, shared_key: Vec<u8>, salt: &[u8]) -> Vec<u8>
     let mut nonce = [0u8; 32];
     hkdf_extract(Sha256::new(), hkdf_salt.code(), nonce_info, &mut nonce);
 
-    // Add padding to input data in accordance with
-    // https://tools.ietf.org/html/draft-ietf-httpbis-encryption-encoding-00#section-2
+    // Sequence number is the same size as the nonce
+    // https://tools.ietf.org/html/draft-thomson-http-encryption-01#section-3.3
     //
-    // "Padding consists of a length byte, followed that number of zero-valued octets.
-    //  A receiver MUST fail to decrypt if any padding octet other than the first is
-    //  non-zero"
-    //
-    // "Valid records always contain at least one byte of padding"
+    // "The record sequence number (SEQ) is a 96-bit unsigned integer in network
+    //  byte order that starts at zero."
+    let mut seq = [0u8; 12];
+
     let mut raw_input = input.into_bytes();
-    raw_input.insert(0, 0);
+    let mut chunks = Vec::new();
+    let mut padding = false;
+    let mut total_size = 0;
 
-    // TODO: if the data is greater than 4096, we need to encrypt
-    // in chunks and change the nonce appropriately
-    assert!(raw_input.len() <= 4095);
+    while !raw_input.is_empty() || padding {
+        // Add padding to input data in accordance with
+        // https://tools.ietf.org/html/draft-ietf-httpbis-encryption-encoding-00#section-2
+        //
+        // "Padding consists of a length byte, followed that number of zero-valued octets.
+        //  A receiver MUST fail to decrypt if any padding octet other than the first is
+        //  non-zero"
+        //
+        // "Valid records always contain at least one byte of padding"
+        raw_input.insert(0, 0);
+        let bound = min(record_size, raw_input.len());
+        let chunk: Vec<_> = raw_input.drain(0..bound).collect();
 
-    // With the generation AES-GCM key/nonce pair, encrypt the payload
-    let mut cipher = AesGcm::new(KeySize::KeySize128, &encrypt_key[0..16], &nonce[0..12], &[0; 0]);
-    let mut tag = [0u8; 16];
-    let mut out = vec![0u8; raw_input.len() + tag.len()];
-    out.truncate(raw_input.len());
-    cipher.encrypt(&raw_input[..], &mut out, &mut tag);
+        // If the final chunk ended on a record boundary, then we
+        // need to append one more record with just padding.
+        // https://tools.ietf.org/html/draft-thomson-http-encryption-01#section-2
+        //
+        // "an encoder MUST append a record that contains only padding and is smaller
+        //  than the full record size if the final record ends on a record boundary."
+        padding = bound == record_size && raw_input.is_empty();
 
-    // Append the authentication tag to the record payload
-    // https://tools.ietf.org/html/draft-thomson-http-encryption-01#section-2
-    //
-    // "Valid records always contain at least one byte of padding and a 16
-    // octet authentication tag."
-    out.extend_from_slice(&tag);
+        // Generate the nonce for this record
+        // https://tools.ietf.org/html/draft-thomson-http-encryption-01#section-3.3
+        //
+        // "NONCE = HMAC-SHA-256(PRK, "Content-Encoding: nonce" || 0x01) ^ SEQ"
+        let mut record_nonce = vec![0u8; 12];
+        record_nonce.clone_from_slice(&nonce[0..12]);
+        let mut i = seq.len();
+        while i > 0 {
+            i -= 1;
+            record_nonce[i] ^= seq[i];
+        }
+
+        // With the generation AES-GCM key/nonce pair, encrypt the payload
+        let mut cipher = AesGcm::new(KeySize::KeySize128, &encrypt_key[0..16], &record_nonce[0..12], &[0; 0]);
+        let mut tag = [0u8; 16];
+        let mut out = vec![0u8; chunk.len() + tag.len()];
+        out.truncate(chunk.len());
+        cipher.encrypt(&chunk[..], &mut out, &mut tag);
+
+        // Append the authentication tag to the record payload
+        // https://tools.ietf.org/html/draft-thomson-http-encryption-01#section-2
+        //
+        // "Valid records always contain at least one byte of padding and a 16
+        // octet authentication tag."
+        out.extend_from_slice(&tag);
+        total_size += out.len();
+        chunks.push(out);
+
+        // Increment the sequence number in network-order
+        i = seq.len();
+        while i > 0 {
+            i -= 1;
+            seq[i] += 1;
+            if seq[i] != 0 {
+                break;
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(total_size);
+    for chunk in chunks {
+        out.extend_from_slice(&chunk[..]);
+    }
     out
 }
 
 #[derive(Debug)]
 pub struct EncryptData {
-    pub public_key: String,
     pub salt: String,
     pub output: Vec<u8>
 }
 
 /// Encrypt a payload using the given public key according to the `WebPush`
 /// RFC specifications.
-pub fn encrypt(peer_key: &str, input: String) -> Option<EncryptData> {
+pub fn encrypt(local_key: &KeyPair, peer_key: &str, input: String, record_size: usize) -> Option<EncryptData> {
     // Derive public and secret keys from peer public key
     let peer_key_bytes = match peer_key.from_base64() {
         Ok(x) => x,
@@ -413,18 +497,10 @@ pub fn encrypt(peer_key: &str, input: String) -> Option<EncryptData> {
         }
     };
 
-    let ecdh = match ecdh_derive_keys(peer_key_bytes.to_hex()) {
-        Some(ekd) => ekd,
+    let shared_key = match ecdh_derive_keys(local_key, peer_key_bytes.to_hex()) {
+        Some(key) => key,
         None => {
             warn!("could not derive keys");
-            return None;
-        }
-    };
-
-    let public_key_bytes = match ecdh.public_key.from_hex() {
-        Ok(x) => x,
-        Err(e) => {
-            warn!("Could not derive keys: {:?}", e);
             return None;
         }
     };
@@ -442,9 +518,8 @@ pub fn encrypt(peer_key: &str, input: String) -> Option<EncryptData> {
     gen.fill_bytes(&mut salt);
 
     Some(EncryptData {
-        public_key: public_key_bytes.to_base64(URL_SAFE),
         salt: salt.to_base64(URL_SAFE),
-        output: aesgcm128_encrypt(input, ecdh.shared_key, &salt)
+        output: aesgcm128_encrypt(input, shared_key, &salt, record_size)
     })
 }
 
@@ -456,7 +531,7 @@ describe! aesgcm128_encrypt {
         let input = String::from("test");
         let shared_key = vec![14, 55, 71, 109, 215, 177, 33, 176, 142, 43, 241, 48, 179, 164, 96, 220, 146, 176, 76, 1, 63, 108, 78, 67, 141, 55, 125, 200, 40, 153, 252, 85];
         let salt = [23, 249, 70, 109, 205, 73, 187, 20, 140, 197, 163, 250, 114, 55, 122, 88];
-        let output = aesgcm128_encrypt(input, shared_key, &salt);
+        let output = aesgcm128_encrypt(input, shared_key, &salt, 4096);
         let expected = vec![177, 172, 8, 114, 38, 164, 249, 255, 11, 140, 152, 0, 194, 82, 79, 121, 26, 116, 68, 34, 182];
         assert_eq!(output, expected);
     }
