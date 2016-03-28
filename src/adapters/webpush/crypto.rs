@@ -11,6 +11,8 @@
 extern crate libc;
 extern crate crypto;
 
+#[cfg(test)]
+use self::crypto::aead::AeadDecryptor;
 use self::crypto::aead::AeadEncryptor;
 use self::crypto::aes_gcm::AesGcm;
 use self::crypto::aes::KeySize;
@@ -34,6 +36,8 @@ const NID_X9_62_PRIMVE256V1: libc::c_int = 415;
 const EVP_PKEY_EC: libc::c_int = 408;
 const EVP_PKEY_OP_PARAMGEN: libc::c_int = 2;
 const EVP_PKEY_CTRL_EC_PARAMGEN_CURVE_NID: libc::c_int = 4097;
+
+const AESGCM_TAG_LEN: usize = 16;
 
 #[repr(C)]
 enum EcPointConversion {
@@ -376,13 +380,7 @@ fn ecdh_derive_keys(local_key: &KeyPair, raw_peer_key : String) -> Option<Vec<u8
     shared_key
 }
 
-/// Encrypts the given payload using AES-GCM 128-bit with the shared key and salt.
-/// The shared key and salt are not used directly but rather are used to derive
-/// the encryption key and nonce as defined in the draft RFC.
-fn aesgcm128_encrypt(input: String, shared_key: Vec<u8>, salt: &[u8], record_size: usize) -> Vec<u8> {
-    assert!(!input.is_empty(), "input cannot be empty");
-    assert!(record_size > 1, "record size must be greater than the padding");
-
+fn aesgcm128_common(salt: &[u8], shared_key: &[u8]) -> ([u8; 32], [u8; 32], [u8; 12]) {
     // Create the HKDF salt from our shared key and transaction salt
     let mut salt_hmac = Hmac::new(Sha256::new(), salt);
     salt_hmac.input(&shared_key[..]);
@@ -405,8 +403,90 @@ fn aesgcm128_encrypt(input: String, shared_key: Vec<u8>, salt: &[u8], record_siz
     //
     // "The record sequence number (SEQ) is a 96-bit unsigned integer in network
     //  byte order that starts at zero."
-    let mut seq = [0u8; 12];
+    let seq = [0u8; 12];
+    (encrypt_key, nonce, seq)
+}
 
+fn aesgcm128_record_nonce(nonce: &[u8], seq: &mut[u8; 12]) -> [u8; 12] {
+    // Generate the nonce for this record
+    // https://tools.ietf.org/html/draft-thomson-http-encryption-01#section-3.3
+    //
+    // "NONCE = HMAC-SHA-256(PRK, "Content-Encoding: nonce" || 0x01) ^ SEQ"
+    let mut record_nonce = [0u8; 12];
+    let mut i = seq.len();
+    while i > 0 {
+        i -= 1;
+        record_nonce[i] = nonce[i] ^ seq[i];
+    }
+
+    // Increment the sequence number in network-order
+    i = seq.len();
+    while i > 0 {
+        i -= 1;
+        seq[i] += 1;
+        if seq[i] != 0 {
+            break;
+        }
+    }
+
+    record_nonce
+}
+
+#[cfg(test)]
+/// Decrypts the given payload using AES-GCM 128-bit with the shared key and salt.
+/// The shared key and salt are not used directly but rather are used to derive
+/// the encryption key and nonce as defined in the draft RFC.
+fn aesgcm128_decrypt(mut input: Vec<u8>, shared_key: &[u8], salt: &[u8], record_size: usize) -> Option<String> {
+    let (decrypt_key, nonce, mut seq) = aesgcm128_common(salt, shared_key);
+    let mut chunks = Vec::new();
+    let mut total_size = 0;
+
+    while !input.is_empty() {
+        let mut bound = min(record_size, input.len());
+        if bound <= AESGCM_TAG_LEN {
+            return None;
+        }
+        bound -= AESGCM_TAG_LEN;
+
+        let chunk: Vec<_> = input.drain(0..bound).collect();
+        let tag: Vec<_> = input.drain(0..AESGCM_TAG_LEN).collect();
+        let record_nonce = aesgcm128_record_nonce(&nonce, &mut seq);
+        let mut output = vec![0u8; chunk.len()];
+
+        // FIXME: fail to decrypt if ends of record boundary
+
+        let mut cipher = AesGcm::new(KeySize::KeySize128, &decrypt_key[0..16], &record_nonce, &[0; 0]);
+        if !cipher.decrypt(&chunk[..], &mut output[..], &tag[..]) {
+            return None;
+        }
+
+        // Strip padding from the plaintext
+        let padding: Vec<_> = output.drain(0..1).collect();
+        let padding_len: usize = padding[0] as usize;
+        let _: Vec<_> = output.drain(0..padding_len).collect();
+        total_size += output.len();
+        chunks.push(output);
+    }
+
+    let mut out = Vec::with_capacity(total_size);
+    for chunk in chunks {
+        out.extend_from_slice(&chunk[..]);
+    }
+
+    match String::from_utf8(out) {
+        Ok(s) => Some(s),
+        Err(_) => None
+    }
+}
+
+/// Encrypts the given payload using AES-GCM 128-bit with the shared key and salt.
+/// The shared key and salt are not used directly but rather are used to derive
+/// the encryption key and nonce as defined in the draft RFC.
+fn aesgcm128_encrypt(input: String, shared_key: &[u8], salt: &[u8; 16], record_size: usize) -> Vec<u8> {
+    assert!(!input.is_empty(), "input cannot be empty");
+    assert!(record_size > 1, "record size must be greater than the padding");
+
+    let (encrypt_key, nonce, mut seq) = aesgcm128_common(salt, shared_key);
     let mut raw_input = input.into_bytes();
     let mut chunks = Vec::new();
     let mut padding = false;
@@ -424,6 +504,7 @@ fn aesgcm128_encrypt(input: String, shared_key: Vec<u8>, salt: &[u8], record_siz
         raw_input.insert(0, 0);
         let bound = min(record_size, raw_input.len());
         let chunk: Vec<_> = raw_input.drain(0..bound).collect();
+        let record_nonce = aesgcm128_record_nonce(&nonce, &mut seq);
 
         // If the final chunk ended on a record boundary, then we
         // need to append one more record with just padding.
@@ -433,21 +514,9 @@ fn aesgcm128_encrypt(input: String, shared_key: Vec<u8>, salt: &[u8], record_siz
         //  than the full record size if the final record ends on a record boundary."
         padding = bound == record_size && raw_input.is_empty();
 
-        // Generate the nonce for this record
-        // https://tools.ietf.org/html/draft-thomson-http-encryption-01#section-3.3
-        //
-        // "NONCE = HMAC-SHA-256(PRK, "Content-Encoding: nonce" || 0x01) ^ SEQ"
-        let mut record_nonce = vec![0u8; 12];
-        record_nonce.clone_from_slice(&nonce[0..12]);
-        let mut i = seq.len();
-        while i > 0 {
-            i -= 1;
-            record_nonce[i] ^= seq[i];
-        }
-
         // With the generation AES-GCM key/nonce pair, encrypt the payload
-        let mut cipher = AesGcm::new(KeySize::KeySize128, &encrypt_key[0..16], &record_nonce[0..12], &[0; 0]);
-        let mut tag = [0u8; 16];
+        let mut cipher = AesGcm::new(KeySize::KeySize128, &encrypt_key[0..16], &record_nonce, &[0; 0]);
+        let mut tag = [0u8; AESGCM_TAG_LEN];
         let mut out = vec![0u8; chunk.len() + tag.len()];
         out.truncate(chunk.len());
         cipher.encrypt(&chunk[..], &mut out, &mut tag);
@@ -460,16 +529,6 @@ fn aesgcm128_encrypt(input: String, shared_key: Vec<u8>, salt: &[u8], record_siz
         out.extend_from_slice(&tag);
         total_size += out.len();
         chunks.push(out);
-
-        // Increment the sequence number in network-order
-        i = seq.len();
-        while i > 0 {
-            i -= 1;
-            seq[i] += 1;
-            if seq[i] != 0 {
-                break;
-            }
-        }
     }
 
     let mut out = Vec::with_capacity(total_size);
@@ -519,20 +578,59 @@ pub fn encrypt(local_key: &KeyPair, peer_key: &str, input: String, record_size: 
 
     Some(EncryptData {
         salt: salt.to_base64(URL_SAFE),
-        output: aesgcm128_encrypt(input, shared_key, &salt, record_size)
+        output: aesgcm128_encrypt(input, &shared_key, &salt, record_size)
     })
 }
+/*
+pub fn decrypt(local_key: &KeyPair, peer_key: &str, input: Vec<u8>, salt: &str, record_size: usize) -> Option<String> {
+    // Derive public and secret keys from peer public key
+    let peer_key_bytes = match peer_key.from_base64() {
+        Ok(x) => x,
+        Err(e) => {
+            warn!("could not base64 decode peer key: {:?}", e);
+            return None;
+        }
+    };
+
+    let shared_key = match ecdh_derive_keys(local_key, peer_key_bytes.to_hex()) {
+        Some(key) => key,
+        None => {
+            warn!("could not derive keys");
+            return None;
+        }
+    };
+
+    let salt_bytes = match salt.from_base64() {
+        Ok(x) => x,
+        Err(e) => {
+            warn!("could not base64 decode salt: {:?}", e);
+            return None;
+        }
+    };
+
+    return Some(aesgcm128_decrypt(input, shared_key, &salt_bytes, record_size);
+}*/
 
 #[cfg(test)]
-describe! aesgcm128_encrypt {
+describe! aesgcm128 {
     it "should encrypt one record" {
         use super::aesgcm128_encrypt;
 
         let input = String::from("test");
-        let shared_key = vec![14, 55, 71, 109, 215, 177, 33, 176, 142, 43, 241, 48, 179, 164, 96, 220, 146, 176, 76, 1, 63, 108, 78, 67, 141, 55, 125, 200, 40, 153, 252, 85];
+        let shared_key = [14, 55, 71, 109, 215, 177, 33, 176, 142, 43, 241, 48, 179, 164, 96, 220, 146, 176, 76, 1, 63, 108, 78, 67, 141, 55, 125, 200, 40, 153, 252, 85];
         let salt = [23, 249, 70, 109, 205, 73, 187, 20, 140, 197, 163, 250, 114, 55, 122, 88];
-        let output = aesgcm128_encrypt(input, shared_key, &salt, 4096);
+        let output = aesgcm128_encrypt(input, &shared_key, &salt, 4096);
         let expected = vec![177, 172, 8, 114, 38, 164, 249, 255, 11, 140, 152, 0, 194, 82, 79, 121, 26, 116, 68, 34, 182];
         assert_eq!(output, expected);
+    }
+
+    it "should decrypt one record" {
+        use super::aesgcm128_decrypt;
+
+        let input = vec![177, 172, 8, 114, 38, 164, 249, 255, 11, 140, 152, 0, 194, 82, 79, 121, 26, 116, 68, 34, 182];
+        let shared_key = [14, 55, 71, 109, 215, 177, 33, 176, 142, 43, 241, 48, 179, 164, 96, 220, 146, 176, 76, 1, 63, 108, 78, 67, 141, 55, 125, 200, 40, 153, 252, 85];
+        let salt = [23, 249, 70, 109, 205, 73, 187, 20, 140, 197, 163, 250, 114, 55, 122, 88];
+        let output = aesgcm128_decrypt(input, &shared_key, &salt, 4096);
+        assert_eq!(output, Some(String::from("test")));
     }
 }
