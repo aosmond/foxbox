@@ -581,7 +581,8 @@ pub fn encrypt(local_key: &KeyPair, peer_key: &str, input: String, record_size: 
         output: aesgcm128_encrypt(input, &shared_key, &salt, record_size)
     })
 }
-/*
+
+#[cfg(test)]
 pub fn decrypt(local_key: &KeyPair, peer_key: &str, input: Vec<u8>, salt: &str, record_size: usize) -> Option<String> {
     // Derive public and secret keys from peer public key
     let peer_key_bytes = match peer_key.from_base64() {
@@ -608,8 +609,8 @@ pub fn decrypt(local_key: &KeyPair, peer_key: &str, input: Vec<u8>, salt: &str, 
         }
     };
 
-    return Some(aesgcm128_decrypt(input, shared_key, &salt_bytes, record_size);
-}*/
+    aesgcm128_decrypt(input, &shared_key, &salt_bytes, record_size)
+}
 
 #[cfg(test)]
 describe! aesgcm128 {
@@ -632,5 +633,21 @@ describe! aesgcm128 {
         let salt = [23, 249, 70, 109, 205, 73, 187, 20, 140, 197, 163, 250, 114, 55, 122, 88];
         let output = aesgcm128_decrypt(input, &shared_key, &salt, 4096);
         assert_eq!(output, Some(String::from("test")));
+    }
+}
+
+#[cfg(test)]
+describe! ecdh {
+    it "should encrypt and decrypt payload" {
+        use super::encrypt;
+        use super::decrypt;
+        use super::generate_key_pair;
+
+        let local_key = generate_key_pair().unwrap();
+        let peer_key = generate_key_pair().unwrap();
+        let input = String::from("testing ecdh");
+        let encrypt_data = encrypt(&local_key, &peer_key.public_key, input.clone(), 4096).unwrap();
+        let decrypt_data = decrypt(&peer_key, &local_key.public_key, encrypt_data.output, &encrypt_data.salt, 4096).unwrap();
+        assert_eq!(input, decrypt_data);
     }
 }
