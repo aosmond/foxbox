@@ -453,7 +453,19 @@ fn aesgcm128_decrypt(mut input: Vec<u8>, shared_key: &[u8], salt: &[u8], record_
         let record_nonce = aesgcm128_record_nonce(&nonce, &mut seq);
         let mut output = vec![0u8; chunk.len()];
 
-        // FIXME: fail to decrypt if ends of record boundary
+        // Fail to decrypt if ends on a record boundary.
+        // https://tools.ietf.org/html/draft-ietf-httpbis-encryption-encoding-01#section-2
+        //
+        // "A sequence of full-sized records can be truncated to produce a
+        //  shorter sequence of records with valid authentication tags.  To
+        //  prevent an attacker from truncating a stream, an encoder MUST append
+        //  a record that contains only padding and is smaller than the full
+        //  record size if the final record ends on a record boundary.  A
+        //  receiver MUST treat the stream as failed due to truncation if the
+        //  final record is the full record size."
+        if input.is_empty() && bound == record_size {
+            return None;
+        }
 
         let mut cipher = AesGcm::new(KeySize::KeySize128, &decrypt_key[0..16], &record_nonce, &[0; 0]);
         if !cipher.decrypt(&chunk[..], &mut output[..], &tag[..]) {
