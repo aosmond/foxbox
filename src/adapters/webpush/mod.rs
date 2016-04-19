@@ -24,7 +24,7 @@ use hyper::header::{ ContentEncoding, Encoding };
 use hyper::Client;
 use hyper::client::Body;
 use rusqlite::{ self };
-use self::crypto::{ encrypt, generate_key_pair, KeyPair };
+use self::crypto::CryptoContext;
 use serde_json;
 use std::cmp::min;
 use std::collections::{ HashMap, HashSet };
@@ -35,6 +35,8 @@ use transformable_channels::mpsc::*;
 
 header! { (Encryption, "Encryption") => [String] }
 header! { (EncryptionKey, "Encryption-Key") => [String] }
+header! { (CryptoKey, "Crypto-Key") => [String] }
+header! { (Ttl, "Ttl") => [u32] }
 
 static ADAPTER_NAME: &'static str = "WebPush adapter (built-in)";
 static ADAPTER_VENDOR: &'static str = "team@link.mozilla.org";
@@ -45,7 +47,8 @@ static NO_AUTH_USER_ID: i32 = -1;
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Subscription {
     pub push_uri: String,
-    pub public_key: String
+    pub public_key: String,
+    pub auth: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -75,7 +78,7 @@ impl ResourceGetter {
 }
 
 impl Subscription {
-    fn notify(&self, local_key: &KeyPair, message: &str) {
+    fn notify(&self, crypto: &CryptoContext, message: &str) {
         // Make the record size at least the size of the encrypted message. We must
         // add 16 bytes for the encryption tag, 1 byte for padding and 1 byte to
         // ensure we don't end on a record boundary.
@@ -94,7 +97,7 @@ impl Subscription {
         // parameter can be omitted for messages that fit within this limit."
         //
         let record_size = min(4096, message.len() + 18);
-        let enc = match encrypt(local_key, &self.public_key, message.to_owned(), record_size) {
+        let enc = match crypto.encrypt(&self.public_key, message.to_owned(), &self.auth, record_size) {
             Some(x) => x,
             None => {
                 warn!("notity subscription {} failed for {}", self.push_uri, message);
@@ -102,24 +105,36 @@ impl Subscription {
             }
         };
 
+        let has_auth = self.auth.is_some();
+        let public_key = crypto.get_public_key(has_auth);
         let client = Client::new();
-        let res = match client.post(&self.push_uri)
-            .header(ContentEncoding(vec![Encoding::EncodingExt(String::from("aesgcm128"))]))
-            .header(EncryptionKey(format!("keyid=p256dh;dh={}", local_key.public_key)))
+        let mut req = client.post(&self.push_uri)
             .header(Encryption(format!("keyid=p256dh;salt={};rs={}", enc.salt, record_size)))
-            .body(Body::BufBody(&enc.output, enc.output.len()))
-            .send() {
-                Ok(x) => x,
-                Err(e) => { warn!("notify subscription {} failed: {:?}", self.push_uri, e); return; }
-            };
+            .body(Body::BufBody(&enc.output, enc.output.len()));
 
-        info!("notified subscription {} (status {:?})", self.push_uri, res.status);
+        req = if has_auth {
+            info!("AO using mar2016 draft");
+            req.header(ContentEncoding(vec![Encoding::EncodingExt(String::from("aesgcm"))]))
+                .header(CryptoKey(format!("keyid=p256dh;dh={}", public_key)))
+                .header(Ttl(60))
+        } else {
+            info!("AO using dec2015 draft");
+            req.header(ContentEncoding(vec![Encoding::EncodingExt(String::from("aesgcm128"))]))
+                .header(EncryptionKey(format!("keyid=p256dh;dh={}", public_key)))
+        };
+
+        let rsp = match req.send() {
+            Ok(x) => x,
+            Err(e) => { warn!("notify subscription {} failed: {:?}", self.push_uri, e); return; }
+        };
+
+        info!("notified subscription {} (status {:?})", self.push_uri, rsp.status);
     }
 }
 
 pub struct WebPush<C> {
     controller: C,
-    local_key: KeyPair,
+    crypto: CryptoContext,
     getter_resource_id: Id<Getter>,
     getter_subscription_id: Id<Getter>,
     setter_resource_id: Id<Setter>,
@@ -356,7 +371,7 @@ impl<C: Controller> WebPush<C> {
     {
         WebPush {
             controller: controller,
-            local_key: generate_key_pair().unwrap(),
+            crypto: CryptoContext::new().unwrap(),
             getter_resource_id: Self::getter_resource_id(),
             getter_subscription_id: Self::getter_subscription_id(),
             setter_resource_id: Self::setter_resource_id(),
@@ -411,10 +426,10 @@ impl<C: Controller> WebPush<C> {
             debug!("no users listening on push resource");
         } else {
             let json = json!({resource: setter.resource, message: setter.message});
-            let local_key = self.local_key.clone();
+            let crypto = self.crypto.clone();
             thread::spawn(move || {
                 for sub in subscriptions {
-                    sub.notify(&local_key, &json);
+                    sub.notify(&crypto, &json);
                 }
             });
         }
