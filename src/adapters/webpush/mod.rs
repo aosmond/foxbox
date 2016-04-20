@@ -64,19 +64,6 @@ impl SubscriptionGetter {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct ResourceGetter {
-    resources: Vec<String>
-}
-
-impl ResourceGetter {
-    fn new(res: Vec<String>) -> Self {
-        ResourceGetter {
-            resources: res
-        }
-    }
-}
-
 impl Subscription {
     fn notify(&self, crypto: &CryptoContext, message: &str) {
         // Make the record size at least the size of the encrypted message. We must
@@ -151,9 +138,7 @@ impl Subscription {
 pub struct WebPush<C> {
     controller: C,
     crypto: CryptoContext,
-    getter_resource_id: Id<Getter>,
     getter_subscription_id: Id<Getter>,
-    setter_resource_id: Id<Setter>,
     setter_subscribe_id: Id<Setter>,
     setter_unsubscribe_id: Id<Setter>,
     setter_notify_id: Id<Setter>,
@@ -168,16 +153,8 @@ impl<C: Controller> WebPush<C> {
         Id::new("service:webpush@link.mozilla.org")
     }
 
-    pub fn getter_resource_id() -> Id<Getter> {
-        Id::new("getter:resource.webpush@link.mozilla.org")
-    }
-
     pub fn getter_subscription_id() -> Id<Getter> {
         Id::new("getter:subscription.webpush@link.mozilla.org")
-    }
-
-    pub fn setter_resource_id() -> Id<Setter> {
-        Id::new("setter:resource.webpush@link.mozilla.org")
     }
 
     pub fn setter_subscribe_id() -> Id<Setter> {
@@ -224,22 +201,16 @@ impl<C: Controller> Adapter for WebPush<C> {
                 NO_AUTH_USER_ID
             };
 
-            macro_rules! getter_api {
-                ($getter:ident, $getter_id:ident, $getter_type:ident) => (
-                    if id == self.$getter_id {
-                        match self.$getter(user_id) {
-                            Ok(data) => {
-                                let rsp = $getter_type::new(data);
-                                return (id, Ok(Some(Value::Json(Arc::new(Json(serde_json::to_value(&rsp)))))));
-                            },
-                            Err(err) => return (id, Err(Error::InternalError(InternalError::GenericError(format!("Database error: {}", err)))))
-                        };
-                    }
-                )
+            if id == self.getter_subscription_id {
+                match self.get_subscriptions(Some(user_id)) {
+                    Ok(data) => {
+                        let rsp = SubscriptionGetter::new(data);
+                        return (id, Ok(Some(Value::Json(Arc::new(Json(serde_json::to_value(&rsp)))))));
+                    },
+                    Err(err) => return (id, Err(Error::InternalError(InternalError::GenericError(format!("Database error: {}", err)))))
+                };
             }
 
-            getter_api!(get_subscriptions, getter_subscription_id, SubscriptionGetter);
-            getter_api!(get_resources, getter_resource_id, ResourceGetter);
             (id.clone(), Err(Error::InternalError(InternalError::NoSuchGetter(id))))
         }).collect()
     }
@@ -291,7 +262,6 @@ impl<C: Controller> Adapter for WebPush<C> {
                 )
             }
 
-            setter_api!(set_resources, "set_resources", setter_resource_id, ResourceGetter);
             setter_api!(set_subscribe, "set_subscribe", setter_subscribe_id, SubscriptionGetter);
             setter_api!(set_unsubscribe, "set_unsubscribe", setter_unsubscribe_id, SubscriptionGetter);
             (id.clone(), Err(Error::InternalError(InternalError::NoSuchSetter(id))))
@@ -311,9 +281,7 @@ impl<C: Controller> WebPush<C> {
         let wp = Arc::new(Self::new(controller));
         let id = WebPush::<C>::id();
         let service_id = WebPush::<C>::service_webpush_id();
-        let getter_resource_id = wp.getter_resource_id.clone();
         let getter_subscription_id = wp.getter_subscription_id.clone();
-        let setter_resource_id = wp.setter_resource_id.clone();
         let setter_subscribe_id = wp.setter_subscribe_id.clone();
         let setter_unsubscribe_id = wp.setter_unsubscribe_id.clone();
         let setter_notify_id = wp.setter_notify_id.clone();
@@ -375,9 +343,7 @@ impl<C: Controller> WebPush<C> {
             }
         }));
 
-        add_getter!(getter_resource_id, "WebPushResource");
         add_getter!(getter_subscription_id, "WebPushSubscription");
-        add_setter!(setter_resource_id, "WebPushResource");
         add_setter!(setter_subscribe_id, "WebPushSubscription");
         add_setter!(setter_unsubscribe_id, "WebPushSubscription");
         Ok(())
@@ -388,9 +354,7 @@ impl<C: Controller> WebPush<C> {
         WebPush {
             controller: controller,
             crypto: CryptoContext::new().unwrap(),
-            getter_resource_id: Self::getter_resource_id(),
             getter_subscription_id: Self::getter_subscription_id(),
-            setter_resource_id: Self::setter_resource_id(),
             setter_subscribe_id: Self::setter_subscribe_id(),
             setter_unsubscribe_id: Self::setter_unsubscribe_id(),
             setter_notify_id: Self::setter_notify_id(),
@@ -417,27 +381,15 @@ impl<C: Controller> WebPush<C> {
         Ok(())
     }
 
-    fn set_resources(&self, user_id: i32, setter: &ResourceGetter) -> rusqlite::Result<()> {
-        try!(self.get_db().set_resources(user_id, &setter.resources));
-        Ok(())
-    }
-
-    fn get_resources(&self, user_id: i32) -> rusqlite::Result<Vec<String>> {
-        self.get_db().get_resources(user_id)
-    }
-
-    fn get_subscriptions(&self, user_id: i32) -> rusqlite::Result<Vec<Subscription>> {
+    fn get_subscriptions(&self, user_id: Option<i32>) -> rusqlite::Result<Vec<Subscription>> {
         self.get_db().get_subscriptions(user_id)
-    }
-
-    fn get_resource_subscriptions(&self, resource: &str) -> rusqlite::Result<Vec<Subscription>> {
-        self.get_db().get_resource_subscriptions(resource)
     }
 
     fn set_notify(&self, _: i32, setter: &WebPushNotify) -> rusqlite::Result<()> {
         info!("notify on resource {}: {}", setter.resource, setter.message);
 
-        let subscriptions = try!(self.get_resource_subscriptions(&setter.resource));
+        // FIXME: should be targetted at a particular user
+        let subscriptions = try!(self.get_subscriptions(None));
         if subscriptions.is_empty() {
             debug!("no users listening on push resource");
         } else {

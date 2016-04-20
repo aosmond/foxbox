@@ -49,11 +49,6 @@ impl WebPushDb {
                     auth        TEXT
             )", &[]).unwrap();
 
-        db.execute("CREATE TABLE IF NOT EXISTS resources (
-                    user_id     INTEGER,
-                    resource    TEXT NOT NULL
-            )", &[]).unwrap();
-
         WebPushDb {
             db: db
         }
@@ -73,55 +68,20 @@ impl WebPushDb {
         )
     }
 
-    /// Sets the resources to subscribe to notifications for the user `user_id`.
-    pub fn set_resources(&self, user_id: i32, resources: &[String]) -> rusqlite::Result<()> {
-        try!(self.db.execute("DELETE FROM resources WHERE user_id=$1", &[&user_id]));
-        for resource in resources.iter() {
-            try!(self.db.execute("INSERT INTO resources VALUES ($1, $2)",
-                                 &[&user_id, &escape(resource)]
-            ));
-        }
-        Ok(())
-    }
-
-    /// Gets the resources subscribed to by the user `user_id`.
-    pub fn get_resources(&self, user_id: i32) -> rusqlite::Result<Vec<String>> {
-        let mut subs = Vec::new();
-        let mut stmt = try!(self.db.prepare("SELECT resource FROM resources WHERE user_id=$1"));
-        let rows = try!(stmt.query(&[&user_id]));
-        let (count, _) = rows.size_hint();
-        subs.reserve_exact(count);
-        for result_row in rows {
-            let row = try!(result_row);
-            subs.push(row.get(0));
-        }
-        Ok(subs)
-    }
-
     /// Gets the push subscriptions for the user `user_id`.
-    pub fn get_subscriptions(&self, user_id: i32) -> rusqlite::Result<Vec<Subscription>> {
+    pub fn get_subscriptions(&self, user_id: Option<i32>) -> rusqlite::Result<Vec<Subscription>> {
         let mut subs = Vec::new();
-        let mut stmt = try!(self.db.prepare("SELECT push_uri, public_key, auth FROM subscriptions WHERE user_id=$1"));
-        let rows = try!(stmt.query(&[&user_id]));
-        let (count, _) = rows.size_hint();
-        subs.reserve_exact(count);
-        for result_row in rows {
-            let row = try!(result_row);
-            subs.push(Subscription {
-                push_uri: row.get(0),
-                public_key: row.get(1),
-                auth: row.get(2)
-            });
-        }
-        Ok(subs)
-    }
-
-    /// Gets the push subscriptions for users who are subscribed to `resource` notifications.
-    pub fn get_resource_subscriptions(&self, resource: &str) -> rusqlite::Result<Vec<Subscription>> {
-        let mut subs = Vec::new();
-        let mut stmt = try!(self.db.prepare("SELECT push_uri, public_key, auth FROM subscriptions WHERE
-                                             user_id IN (SELECT user_id FROM resources WHERE resource=$1)"));
-        let rows = try!(stmt.query(&[&escape(resource)]));
+        let mut stmt;
+        let rows = match user_id {
+            Some(uid) => {
+                stmt = try!(self.db.prepare("SELECT push_uri, public_key, auth FROM subscriptions WHERE user_id=$1"));
+                try!(stmt.query(&[&uid]))
+            },
+            None => {
+                stmt = try!(self.db.prepare("SELECT push_uri, public_key, auth FROM subscriptions"));
+                try!(stmt.query(&[]))
+            }
+        };
         let (count, _) = rows.size_hint();
         subs.reserve_exact(count);
         for result_row in rows {
@@ -162,10 +122,10 @@ describe! tests {
         let db = WebPushDb::new(&get_db_environment());
     }
 
-    it "should manage subscription correctly" {
+    it "should manage subscription correctly for user" {
         use super::super::Subscription;
 
-        let subs0 = db.get_subscriptions(1).unwrap();
+        let subs0 = db.get_subscriptions(Some(1)).unwrap();
         assert_eq!(subs0.len(), 0);
 
         let sub = Subscription {
@@ -175,35 +135,17 @@ describe! tests {
         };
         db.subscribe(1, &sub).unwrap();
 
-        let subs1 = db.get_subscriptions(1).unwrap();
+        let subs1 = db.get_subscriptions(Some(1)).unwrap();
         assert_eq!(subs1.len(), 1);
         assert_eq!(subs1[0], sub);
 
         db.unsubscribe(1, &sub.push_uri).unwrap();
 
-        let subs2 = db.get_subscriptions(1).unwrap();
+        let subs2 = db.get_subscriptions(Some(1)).unwrap();
         assert_eq!(subs2.len(), 0);
     }
 
-    it "should manage resources correctly" {
-        let res0 = db.get_resources(1).unwrap();
-        assert_eq!(res0.len(), 0);
-
-        let res = vec!["resource1".to_owned(), "resource2".to_owned()];
-        db.set_resources(1, &res).unwrap();
-
-        let res1 = db.get_resources(1).unwrap();
-        assert_eq!(res1.len(), 2);
-        assert_eq!(res1[0], "resource1".to_owned());
-        assert_eq!(res1[1], "resource2".to_owned());
-
-        db.set_resources(1, &[]).unwrap();
-
-        let res2 = db.get_resources(1).unwrap();
-        assert_eq!(res2.len(), 0);
-    }
-
-    it "should yield subscriptions given a resource" {
+    it "should yield correct number subscriptions with multiple users" {
         use super::super::Subscription;
 
         db.subscribe(1, &Subscription {
@@ -221,29 +163,23 @@ describe! tests {
             public_key: "u2_sub0_pkey".to_owned(),
             auth: Some("u2_sub0_auth".to_owned())
         }).unwrap();
-        let u3_sub0 = Subscription {
+        db.subscribe(3, &Subscription {
             push_uri: "u3_sub0_puri".to_owned(),
             public_key: "u3_sub0_pkey".to_owned(),
             auth: Some("u3_sub0_auth".to_owned())
-        };
-        db.subscribe(3, &u3_sub0).unwrap();
+        }).unwrap();
 
-        db.set_resources(1, &["res1".to_owned()]).unwrap();
-        db.set_resources(2, &["res1".to_owned(), "res2".to_owned()]).unwrap();
-        db.set_resources(3, &["res2".to_owned(), "res3".to_owned()]).unwrap();
+        let subs1 = db.get_subscriptions(Some(1)).unwrap();
+        assert_eq!(subs1.len(), 2);
 
-        let subs1 = db.get_resource_subscriptions("res1").unwrap();
-        assert_eq!(subs1.len(), 3);
+        let subs2 = db.get_subscriptions(Some(2)).unwrap();
+        assert_eq!(subs2.len(), 1);
 
-        let subs2 = db.get_resource_subscriptions("res2").unwrap();
-        assert_eq!(subs2.len(), 2);
-
-        let subs3 = db.get_resource_subscriptions("res3").unwrap();
+        let subs3 = db.get_subscriptions(Some(3)).unwrap();
         assert_eq!(subs3.len(), 1);
-        assert_eq!(subs3[0], u3_sub0);
 
-        let subs4 = db.get_resource_subscriptions("res4").unwrap();
-        assert_eq!(subs4.len(), 0);
+        let subs_all = db.get_subscriptions(None).unwrap();
+        assert_eq!(subs_all.len(), 4);
     }
 
     after_each {
